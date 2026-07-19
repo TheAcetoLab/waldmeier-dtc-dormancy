@@ -1,7 +1,7 @@
-name: waldmeier-dtc-dormancy
+name: DTC dormancy
 output_dir: ../docs
 navbar:
-  title: waldmeier-dtc-dormancy
+  title: dtc-dormancy
   left:
   - text: Home
     href: index.html
@@ -12,10 +12,13 @@ navbar:
   right:
   - icon: fab fa-github
     text: Source code
-    href: https://github.com/TheAcetoLab/waldmeier-dtc-dormancy
+    href: https://github.com/acetolab/waldmeier-dtc-dormancy
 output:
   workflowr::wflow_html:
     toc: yes
     toc_float: yes
     theme: cosmo
     highlight: textmate
+    number_sections: yes
+    code_folding: hide
+    toc_depth: 5

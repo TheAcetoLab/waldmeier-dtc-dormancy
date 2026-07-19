@@ -1,0 +1,367 @@
+---
+title: "RNA-seq of BR16 experiments"
+subtitle: "Compare results between BR16 experiments"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  se_file_1: ./output/rnaseq/br16_dtc/se_GRCh38_RFP_mVenus_gene_qc.rds
+  se_file_2: ./output/rnaseq/br16_bulk/se_gene.rds
+  dge_file_1: ./output/rnaseq/br16_dtc/dge_hclusters/dge-edgeR_QLF.rds
+  dge_file_2: ./output/rnaseq/br16_bulk/dge/dge-edgeR_QLF.rds
+  gse_file_1: ./output/rnaseq/br16_dtc/dge_hclusters/gse_omnibus-edgeR_QLF.rds
+  gse_file_2: ./output/rnaseq/br16_bulk/dge/gse_omnibus-edgeR_QLF.rds
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+# dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(ggpubr)
+library(ComplexHeatmap)
+library(circlize)
+library(ggrastr)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/eigencorval.R')
+source('./code/R-functions/subchunkify.R')
+source('./code/R-functions/pairwise_terms_jc.r')
+
+clean_msigdb_names <- function(x) x %>% gsub('REACTOME_', '', .) %>% gsub('WP_', '', .) %>% gsub('BIOCARTA_', '', .) %>% gsub('KEGG_', '', .) %>% gsub('PID_', '', .) %>% gsub('GOBP_', '', .) %>% gsub('_', ' ', .)
+```
+
+Define additional functions
+```{r add-functions}
+clean_sample_alias <- function(x) 
+  gsub('o[0-9]*_[0-9]*-|_gDNA.*', '', x) %>% gsub(".*-MS", "MS", .) %>% gsub("_S[0-9]+_R[0-9].*", "", .) %>% gsub('__STARpass1', '', .) %>% gsub(".k2report", "", .) %>% gsub(".*-|.disambiguated.*", "", .)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Load data
+```{r load-data}
+se_sc <- readRDS(params$se_file_1)
+dge_sc <- readRDS(params$dge_file_1)
+gse_sc <- readRDS(params$gse_file_1)
+
+se_b <- readRDS(params$se_file_2)
+dge_b <- readRDS(params$dge_file_2)
+gse_b <- readRDS(params$gse_file_2)
+```
+
+Load list of dormancy genes
+```{r load-dormancy-genes}
+dormancy_genes <- read_csv(file = './data/resources/list_of_dormancy_genes_MS_20230823.csv')
+dormancy_genes_ar <- read_csv(file = './data/resources/list_of_dormancy_genes_AR_20231201.tsv.txt') %>% pull('Gene')
+```
+
+
+Start indexes of results
+```{r start-gene-comp-list}
+gene_comp_list <- list()
+```
+
+
+
+
+## p27--over--WT at 96h
+Compare results from :
+
+  - Xenograft scRNA-seq **Dormant over Cycling** defined after clustering
+  - Bulk dox treatment experiment: **p27 over WT** adjusted by time
+
+  
+```{r p27-wt-conf}
+bulk_index <- "p27-wt-96"
+
+
+# Join DGE tables
+data_sc <- dge_sc[['Dormant--over--Cycling']]$results %>% 
+  dplyr::select(feature, gene_name, logFC, PValue, FDR, description) 
+
+data_b <- dge_b[[bulk_index]]$results %>% 
+  dplyr::select(feature, gene_name, logFC, PValue, FDR, description)
+
+study_sign_palette <- c(`scRNA and bulk` = '#C85200', scRNA = '#18A188', bulk = 'grey50', none = 'grey90')
+
+dge_joined<- data_sc %>% 
+  left_join(data_b, by = c('feature', 'gene_name', 'description'), suffix = c('_sc', '_bulk')) %>% 
+  mutate(
+    FDR_bulk = ifelse(is.na(FDR_bulk), 1, FDR_bulk),
+    study_sign = ifelse(FDR_sc < 0.05, 'scRNA', 'none'),
+    study_sign = ifelse(FDR_bulk < 0.05, 'bulk', study_sign),
+    study_sign = ifelse(FDR_sc < 0.05 & FDR_bulk < 0.05, 'scRNA and bulk', study_sign),
+    study_sign = factor(study_sign, levels = rev(names(study_sign_palette))),
+    FDR_mean = (FDR_sc + FDR_bulk) / 2,
+    logFC_mean = (logFC_sc + logFC_bulk) / 2
+  )
+
+# Join GSE tables
+data_sc <- gse_sc[['Dormant--over--Cycling']]$GSEA[['msigdb.c2.cp']]@result
+data_b <- gse_b[[bulk_index]]$GSEA[['msigdb.c2.cp']]@result
+gse_joined <- data_sc %>% 
+  left_join(data_b, by = c('ID', 'Description'), suffix = c('_sc', '_bulk')) %>% 
+  mutate(
+    FDR_bulk = ifelse(is.na(p.adjust_bulk), 1, p.adjust_bulk),
+    study_sign = ifelse(p.adjust_sc < 0.05, 'scRNA', 'none'),
+    study_sign = ifelse(p.adjust_bulk < 0.05, 'bulk', study_sign),
+    study_sign = ifelse(p.adjust_sc < 0.05 & p.adjust_bulk < 0.05, 'scRNA and bulk', study_sign),
+    study_sign = factor(study_sign, levels = rev(names(study_sign_palette))),
+    p.adjust_mean = (p.adjust_sc + p.adjust_bulk) / 2,
+    NES_mean = (NES_sc + NES_bulk) / 2
+  )
+gse_joined_long <- rbind(
+  data_sc %>% mutate(study = 'scRNA-seq'),
+  data_b %>% mutate(study = 'bulk')
+) 
+```
+
+### Differential gene expression
+
+#### Table
+
+Significant genes (FDR<0.05) in either scRNA-seq or bulk experiment
+```{r p27-wt-deg-table}
+dge_joined %>% 
+  filter(FDR_sc < 0.05 | FDR_bulk < 0.05) %>%
+  datatable(., 
+            rownames = FALSE, 
+            filter = 'top', 
+            caption = 'Combined DEG results',
+            extensions = 'Buttons', 
+            options = list(
+              dom = 'Blfrtip',
+              buttons = c('csv', 'excel')
+            )) %>% 
+  formatRound(c('logFC_sc', 'logFC_bulk', 'logFC_mean')) %>% 
+  formatSignif(c('FDR_sc', 'FDR_bulk', 'FDR_mean')) %>% 
+  formatStyle(
+    'study_sign',
+    target = 'row',
+    backgroundColor = styleEqual(c('scRNA and bulk', 'scRNA', 'bulk', 'none'), 
+                                 study_sign_palette
+                                 ) ) 
+
+```
+
+#### Fold-changes scatterplot
+```{r p27-wt-logFC-correlation-shared_genes-plot, fig.width = 3.2, fig.asp = 0.7}
+cor_res <- cor.test(dge_joined$logFC_sc, dge_joined$logFC_bulk, method = 'spearman')
+cor_res_txt <- paste0("r = ", round(cor_res$estimate, 2),", p = ", format.pval(cor_res$p.value, digits = 2))
+
+top_genes <- dge_joined %>% filter(study_sign == 'scRNA and bulk') %>% arrange(desc(abs(logFC_mean))) %>% head(20)
+
+dge_joined %>% 
+  ggplot(aes(logFC_sc, logFC_bulk, color = study_sign, label = gene_name)) +
+  geom_point_rast(alpha = 0.6, pch = 16, size = 1) +
+  scale_color_manual(values = study_sign_palette) +
+  geom_abline(lty = 'dashed', color = 'gray60') +
+  geom_hline(yintercept = 0, lty = 'dashed', color = 'gray60') +
+  geom_vline(xintercept = 0, lty = 'dashed', color = 'gray60') +
+  geom_text_repel(color = 'black', data = top_genes, min.segment.length = 0, seed = 42, box.padding = 0.25, max.overlaps = Inf, show.legend = FALSE, size = geom_text_size*0.8, segment.size = linewidth_default) +
+  labs(
+    x = expression(paste("lo", g[2],"(fold-change) scRNA-seq")),
+    y = expression(paste("lo", g[2],"(fold-change) bulk")),
+    color = 'Classification based\non FDR<0.05',
+    caption = paste('Top-20 shared genes labelled\n', 'Spearman', cor_res_txt)
+  )
+
+```
+
+
+
+#### Fold-changes scatterplot:  scRNA-seq genes
+
+here we show the correlation only genes in scRNA-seq that have a FDR < 0.05
+```{r p27-wt-logFC-correlation-scrna_genes-plot, fig.width = 3.2, fig.asp = 0.7}
+use_cd <- dge_joined %>% filter(FDR_sc < 0.05)
+cor_res <- cor.test(use_cd$logFC_sc, use_cd$logFC_b, method = 'spearman')
+cor_res_txt <- paste0("r = ", round(cor_res$estimate, 2),", p = ", format.pval(cor_res$p.value, digits = 2))
+
+use_cd %>% 
+  ggplot(aes(logFC_sc, logFC_bulk, color = study_sign, label = gene_name)) +
+  geom_point_rast(alpha = 0.6, pch = 16, size = 1.5) +
+  geom_smooth(aes(logFC_sc, logFC_bulk), color = 'blue', method = 'gam') +
+  scale_color_manual(values = study_sign_palette) +
+  geom_abline(lty = 'dashed', color = 'gray60') +
+  geom_hline(yintercept = 0, lty = 'dashed', color = 'gray60') +
+  geom_vline(xintercept = 0, lty = 'dashed', color = 'gray60') +
+  labs(
+    x = expression(paste("lo", g[2],"(fold-change) scRNA-seq")),
+    y = expression(paste("lo", g[2],"(fold-change) bulk")),
+    color = 'Classification based\non FDR<0.05',
+    caption = paste('Spearman', cor_res_txt, '\nBlue line shows GAM fit and shaded area its confidence interval')
+  ) +
+  theme(
+    plot.caption = element_text(size = 6)
+  )
+```
+
+
+### Functional enrichment
+
+#### Table
+Significant genes (FDR<0.05) in either scRNA-seq or bulk experiment
+```{r p27-wt-gse-table}
+gse_joined %>% 
+  filter(p.adjust_sc < 0.05 | p.adjust_bulk < 0.05) %>%
+  datatable(., 
+            rownames = FALSE, 
+            filter = 'top', 
+            caption = 'Combined GSEA results',
+            extensions = 'Buttons', 
+            options = list(
+              dom = 'Blfrtip',
+              buttons = c('csv', 'excel')
+            )) %>% 
+  formatRound(c('NES_sc', 'NES_bulk', 'NES_mean')) %>% 
+  formatSignif(c('p.adjust_sc', 'p.adjust_bulk', 'p.adjust_mean')) %>% 
+  formatStyle(
+    'study_sign',
+    target = 'row',
+    backgroundColor = styleEqual(c('scRNA and bulk', 'scRNA', 'bulk', 'none'), 
+                                 study_sign_palette
+                                 ) ) 
+
+```
+
+
+#### NES scatterplot
+```{r p27-wt-gse-nes-correlation-shared_genes-plot, fig.width = 3.2, fig.asp = 0.7}
+cor_res <- cor.test(gse_joined$NES_sc, gse_joined$NES_bulk, method = 'spearman')
+cor_res_txt <- paste0("r = ", round(cor_res$estimate, 2),", p = ", format.pval(cor_res$p.value, digits = 2))
+
+top_gset <- gse_joined %>% filter(study_sign == 'scRNA and bulk') %>% arrange(desc(abs(NES_mean))) %>% head(20)
+
+gse_joined %>% 
+  filter(!is.na(study_sign)) %>% 
+  mutate(
+    Description = clean_msigdb_names(Description),
+    study_sign = factor(study_sign, levels = names(study_sign_palette))
+  ) %>% 
+  ggplot(aes(NES_sc, NES_bulk, color = study_sign, label = Description)) +
+  geom_point_rast(alpha = 0.6, pch = 16, size = 1) +
+  scale_color_manual(values = study_sign_palette) +
+  geom_abline(lty = 'dashed', color = 'gray60') +
+  geom_hline(yintercept = 0, lty = 'dashed', color = 'gray60') +
+  geom_vline(xintercept = 0, lty = 'dashed', color = 'gray60') +
+  # geom_text_repel(color = 'black', data = top_gset, min.segment.length = 0, seed = 42, box.padding = 0.25, max.overlaps = Inf, show.legend = FALSE, size = geom_text_size*0.8, segment.size = linewidth_default) +
+  labs(
+    x = "NES scRNA-seq",
+    y = "NES bulk",
+    color = 'Classification based\non Adjusted P < 0.05',
+    # caption = paste('Top-20 shared genes labelled\n', 'Spearman', cor_res_txt),
+    caption = paste('Spearman', cor_res_txt)
+  )
+```
+
+
+#### Dotplot
+Dotplot showing the top-20 downregulated and top-20 upregulated gene-sets in scRNA-seq, and its results in the bulk experiment
+```{r p27-wt-gse-dotplot-down, fig.width = 7.2, fig.asp = 0.7}
+use_id_down <- gse_joined %>% 
+  filter(NES_sc < 0) %>%
+  filter(p.adjust_sc < 0.05) %>% 
+  arrange(p.adjust_sc) %>% 
+  pull(Description) %>% 
+  head(20)
+
+use_id_top <- gse_joined %>% 
+  filter(NES_sc > 0) %>%
+  filter(p.adjust_sc < 0.05) %>% 
+  arrange(p.adjust_sc) %>% 
+  pull(Description) %>% 
+  head(20)
+
+use_id <- c(as.character(use_id_top), as.character(use_id_down))
+
+use_linewidth <- 1/2.141959
+use_data <- gse_joined_long %>% 
+  filter(Description %in% use_id) %>% 
+  mutate(
+    Description = clean_msigdb_names(Description),
+    Description = factor(Description, levels = unique(clean_msigdb_names(use_id))),
+    study = factor(study, levels = c('scRNA-seq', 'bulk'))
+  ) %>% 
+  group_by(Description, study) %>% 
+  slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+use_data %>% 
+  ggplot(aes(NES, Description, color = NES, size = -log10(p.adjust))) +
+  geom_point() +
+  scale_y_discrete(labels =  default_labeller(70)) +
+  scale_x_continuous(expand = expansion(mult = c(0.1, 0.1))) +
+  scale_color_gradient2(trans = "reverse") +
+  scale_size_continuous(range = c(1.3, 3)) +
+  facet_wrap(~study) +
+  geom_vline(xintercept = 0, lty = 'dashed', color = 'gray60') +
+  labs(
+    x = 'Normalized enrichment score',
+    y = NULL,
+    color = 'NES',
+    size = expression(-log[10](Adjusted~p-value))
+  ) +
+  theme_facet
+
+```

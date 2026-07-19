@@ -1,0 +1,277 @@
+---
+title: "Analysis of drug treatment in vivo experiment"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  data: ./data/external/experiments/drug_treatment-in_vivo-raw_data.xlsx
+---
+  
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+# library(showtext)
+# library(foreach)
+# library(DT)
+library(knitr)
+library(magrittr)
+library(kableExtra)
+# library(cowplot)
+# library(colorblindr)
+# library(ggbeeswarm)
+# library(arsenal)
+# library(patchwork)
+library(openxlsx)
+library(ggbeeswarm)
+library(scales)
+
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Load data
+```{r load-data}
+data <- read.xlsx(params$data)
+data %<>% 
+  mutate(
+    drug = factor(drug, levels = data$drug %>% unique),
+    condition = factor(condition, levels = c('wt', 'p27'))
+  )
+```
+
+## Data wrangling
+```{r dw-ctrl-normalization}
+ctrl_means <- data %>% 
+  filter(drug == 'Control') %>% 
+  group_by(condition) %>%
+  summarise(mean_n_cells = mean(n_cells))
+ctrl_means <- ctrl_means$mean_n_cells %>% set_names(ctrl_means$condition)
+
+data %<>% 
+  mutate(
+    n_cells_norm = ifelse(condition == 'wt', n_cells / ctrl_means['wt'], NA),
+    n_cells_norm = ifelse(condition == 'p27', n_cells / ctrl_means['p27'], n_cells_norm),
+    n_cells_lognorm = log2(n_cells_norm)
+    )
+```
+
+
+## Data descriptive
+```{r data-descriptive}
+data %>% 
+  group_by(condition, drug) %>% 
+  summarise(
+    mean_n_cells = mean(n_cells) %>% round(1),
+    var_n_cells = var(n_cells) %>% round(2),
+    sd_n_cells = sd(n_cells) %>% round(2),
+    sem_n_cells = sd(n_cells)/sqrt(n())%>% round(2),
+    mean_n_cells_norm = mean(n_cells_norm)%>% round(2),
+    sd_n_cells_norm = sd(n_cells_norm)%>% round(2),
+    sem_n_cells_norm = sd(n_cells_norm)/sqrt(n())%>% round(2)
+  ) %>% 
+  kbl(caption = 'Descriptive statistics of the data', align = "llrrrrrr") %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+## Data visualization
+
+### Raw data barplot
+```{r barplot-raw_data}
+ggplot(data, aes(x = drug, y = n_cells, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", position = position_dodge(0.9)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               position = position_dodge(0.9), width = 0.2) +
+  # geom_bw(alpha = 0.4) +
+  geom_quasirandom(width=0.2, alpha = 0.5) +
+  scale_y_continuous(expand = expansion(mult = c(0.03, 0.1))) +
+  facet_grid(cols = vars(condition)) +
+  labs(x = "",
+       y = "Cell counts\nin metastasized femur",
+       fill = "Condition",
+       caption = "Error bars represent SEM") +
+  theme_facet +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set1")
+
+
+ggplot(data, aes(x = drug, y = n_cells, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", position = position_dodge(0.9)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               position = position_dodge(0.9), width = 0.2) +
+  # geom_bw(alpha = 0.4) +
+  geom_quasirandom(width=0.2, alpha = 0.5) +
+  scale_y_continuous(expand = expansion(mult = c(0.03, 0.1))) +
+  facet_wrap(vars(condition), scales = 'free_y') +
+  labs(x = "",
+       y = "Cell counts\nin metastasized femur",
+       fill = "Condition",
+       caption = "Error bars represent SEM") +
+  theme_facet +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set1")
+```
+
+
+### Normalized data barplot
+```{r barplot-norm_data}
+ggplot(data, aes(x = drug, y = n_cells_norm, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", position = position_dodge(0.9)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               position = position_dodge(0.9), width = 0.2) +
+  # geom_bw(alpha = 0.4) +
+  geom_quasirandom(width=0.2, alpha = 0.5) +
+  scale_y_continuous(
+    trans = pseudo_log_trans(base = 2),
+    expand = expansion(mult = c(0.02, 0.1))
+    ) +
+  facet_grid(cols = vars(condition)) +
+  labs(x = "",
+       # y = expression(paste("lo", g[2],"(Normalized number of cells)")),
+       y = "Normalized number of cells\nin metastasized femur",
+       fill = "Condition") +
+  theme_facet +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set1")
+```
+
+
+```{r barplot-norm_data2}
+ggplot(data, aes(x = drug, y = n_cells_norm, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", position = position_dodge(0.9)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               position = position_dodge(0.9), width = 0.2) +
+  # geom_bw(alpha = 0.4) +
+  geom_quasirandom( 
+    aes(fill = condition),
+    dodge.width = 0.9,
+    width = 0.1,
+    alpha = 0.5) +
+  scale_y_continuous(
+    trans = pseudo_log_trans(base = 2),
+    expand = expansion(mult = c(0.02, 0.1))
+    ) +
+  # facet_grid(cols = vars(condition)) +
+  labs(x = "",
+       # y = expression(paste("lo", g[2],"(Normalized number of cells)")),
+       y = "Normalized number of cells\nin metastasized femur",
+       fill = "Condition") +
+  theme_facet +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set1")
+
+```
+
+
+## Statistical analysis
+
+### Preliminary considerations
+```{r sa-anova}
+model <- aov(n_cells ~ condition * drug, data = data)
+st_res <- shapiro.test(residuals(model)) 
+
+# Root square of data for normality of residuals
+data$n_cells_sqrt <- sqrt(data$n_cells)
+model_sqrt <- aov(n_cells_sqrt ~ condition * drug, data = data)
+st_sqrt_res <- shapiro.test(residuals(model_sqrt))
+```
+
+Two-way ANOVA is not the appropiate approach. We have counts as dependent variable, that often follow a Poisson distribution, and the normality assumption of ANOVA is not met. The Shapiro-Wilk normality test on the residuals of the ANOVA model gives a p-value of `r st_res$p.value`, indicating that the residuals are not normally distributed. This is not surprising given the small sample size (n = 5 per group) and the nature of the data (count data). Also the low sample size (n = 5) and the high variability of the data make it difficult to meet the assumptions of ANOVA and to detect significant differences between groups.
+
+The alternative of using T-test with normalized values is not appropiate either, because the normality assumption is not met. In addition, normalize using the ratio with the control mean, assumes that the SE in controls is 0, which is not the case.
+
+
+### GLM with negative binomial distribution and EMM analysis
+
+The best alternative is to use a Generalized Linear Model (GLM) with a negative binomial error distribution and log link function to account for overdispersion and the mean–variance relationship typical of biological proliferation assays. The condition (wt or p27) and the treatment were included as a fixed factors, and the interaction term (condition\*treatment) was included to test whether drug response differed between genotypes. Then, estimated marginal means were calculated from the fitted model using the emmeans R package (R). For each drug, condition-dependent drug sensitivity was assessed using interaction contrasts comparing the change relative to control in WT with the change relative to control in p27 (**(WT drug - WT control) vs (p27 drug - p27 control)** ). P-values were adjusted for multiple testing across drugs using the Benjamini–Hochberg false discovery rate procedure.
+
+<!-- Cell counts were analysed using negative binomial generalized linear models with genotype, treatment, and their interaction as fixed effects. Genotype-specific drug effects were evaluated using interaction contrasts derived from estimated marginal means (emmeans), comparing each drug to its respective control within genotype. Multiple comparisons were corrected using the Benjamini–Hochberg method. -->
+
+<!-- Why do we need emms and not just look at the interaction term of the GLM? The interaction term in the GLM will tell us if there is a significant interaction between condition and drug, but it does not provide information about which specific comparisons are driving that interaction. By using emmeans and performing pairwise contrasts, we can identify which specific drug treatments differ between the WT and p27 conditions, and we can also adjust for multiple comparisons to control the false discovery rate. -->
+
+<!-- The interaction coefficient (p27:DrugA) is not the drug effect difference, it is the difference of log ratios : B interaction = log(p27drug/p27cntrl) - log(WTdrug/WTcntrl) = log((p27drug/p27cntrl) / (WTdrug/WTcntrl)) . So the interaction coefficient is not the drug effect difference, but the difference of log ratios, which is not the same thing. Biologically, what we want is (p27 drug - p27 control) vs (WT drug - WT control), those are not the same hypothesis.  -->
+
+
+```{r sa-glm-nb-mme}
+library(MASS)      # For glm.nb
+library(emmeans)   # For post-hoc interaction contrasts
+
+# Negative binomial GLM with interaction
+model_nb <- glm.nb(n_cells ~ condition * drug, data = data)
+
+# This tells you if, overall, drug effects vary by condition
+# anova(model_nb)
+
+# Perform posthoc analysis contrast
+emm_nb <- emmeans(model_nb, ~ condition * drug)
+interaction_contrasts <- contrast(emm_nb, interaction = "pairwise")
+
+# Final table of results
+emm_nb_res <- summary(interaction_contrasts, infer = TRUE) %>% data.frame %>% filter(grepl('Control', drug_pairwise)) %>% mutate(p.adj = p.adjust(p.value))
+```
+
+
+```{r sa-glm-mme-table}
+# Output table
+emm_nb_res %>% 
+  mutate(
+    estimate = round(estimate, 2),
+    SE = round(SE, 2),
+    asymp.LCL	 = round(asymp.LCL, 2),
+    asymp.UCL	 = round(asymp.UCL, 2),
+    z.ratio = round(z.ratio, 2),
+    p.value = format.pval(p.value, 2),
+    p.adj = format.pval(p.adj, 2)
+  ) %>% 
+  kbl(caption = 'Results of GLM with negative binomial distribution and EMM analysis', align = "llrrrrrr") %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+```
+
+
+```{r sa-glm-mme-plot}
+emm_nb_res %>% 
+  mutate(drug_name = gsub(".*Control - ", "", drug_pairwise)) %>% 
+  ggplot(aes(x = estimate, y = reorder(drug_name, estimate))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  geom_errorbarh(aes(xmin = asymp.LCL, xmax = asymp.UCL), height = 0.2) +
+  geom_point(size = 3)  +
+  labs(title = "Drug - Condition interaction analysis",
+       y = "",
+       x = "Interaction estimate",
+       caption = "Error bars represent 95%CI") +
+  theme_project +
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank()
+        )
+```

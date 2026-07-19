@@ -1,11 +1,32 @@
 ---
-title: "Home"
+title: "Analysis of dormancy in DTC"
 site: workflowr::wflow_site
 output:
   workflowr::wflow_html:
-    toc: false
+    toc: true
 editor_options:
   chunk_output_type: console
 ---
 
-Welcome to my research website.
+
+
+# Analysis of experiments
+
+- [In-vivo drug treatment](drug_treatment-in_vivo-analysis.html)
+
+- [Time-series of DTC counts](dtc-timeseries-analysis.html)
+
+
+# BR16 DTC
+- [Differential expression](br16-dtc-rnaseq-dge.html)
+
+- [Re-categorze dormant samples with hierarchical clustering](br16-dtc-rnaseq-dormant-classification.html) 
+
+# BR16 cell culture
+
+- [Differential expression](br16-cell_culture-rnaseq-dge.html)
+
+
+# BR16 DTC adnd cell culture comparison
+- [Comparison of xenograft and bulk results ](br16-rnaseq-compare-experiments-hclust.html)
+

@@ -1,0 +1,1343 @@
+---
+title: "Recategorize BR16 dormant cells"
+subtitle: "Recategorize cells based on differential expressed genes in Bright over Cycling"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  data_dir: ./output/rnaseq/br16_dtc
+  dge_dir: ./output/rnaseq/br16_dtc/dge
+  output_dir: ./output/rnaseq/br16_dtc/dge_hclusters
+  se_file: se_GRCh38_RFP_mVenus_gene_qc.rds
+  vector_dorm: mVenus
+  min_counts: 3
+  min_present_prop: 0.70
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 300, dev = c("png", "pdf"), engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(ggpubr)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(dynamicTreeCut)
+library(colorspace)
+library(GSVA)
+library(GSEABase)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/eigencorval.R')
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/subchunkify.R')
+source('./code/R-functions/pairwise_terms_jc.r')
+clean_msigdb_names <- function(x) x %>% gsub('REACTOME_', '', .) %>% gsub('WP_', '', .) %>% gsub('BIOCARTA_', '', .) %>% gsub('KEGG_', '', .) %>% gsub('PID_', '', .) %>% gsub('GOBP_', '', .) %>% gsub('_', ' ', .)
+```
+
+Define additional functions
+```{r add-functions}
+clean_sample_alias <- function(x) 
+  gsub('o[0-9]*_[0-9]*-|_gDNA.*', '', x) %>% gsub(".*-MS", "MS", .) %>% gsub("_S[0-9]+_R[0-9].*", "", .) %>% gsub('__STARpass1', '', .) %>% gsub(".k2report", "", .) %>% gsub(".*-|.disambiguated.*", "", .)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Load SummarizedExperiment object
+```{r load-se}
+se <- readRDS(file.path(params$data_dir, paste0(params$se_file)))
+```
+
+Load list of dormancy genes
+```{r load-dormancy-genes}
+dormancy_genes <- read_csv(file = './data/resources/list_of_dormancy_genes_MS_20230823.csv')
+```
+
+Load differential expression and functional enrichment data
+```{r load-deg-data}
+dge_list <- readRDS(file.path(params$dge_dir, 'dge-edgeR_QLF.rds'))
+gse_list <- readRDS(file.path(params$dge_dir, 'gse_omnibus-edgeR_QLF.rds'))
+
+# Annotate dge_list with dormancy genes
+i <- names(dge_list)[[1]]
+for (i in names(dge_list)) {
+  dge_list[[i]]$results$is_dormancy <- 
+    dge_list[[i]]$results$gene_name %in% dormancy_genes$gene_name
+}
+```
+
+Configure gene sets for functional enrichment
+```{r conf-gse_omnbus}
+msigdb_vs <- 'v2026.1.Hs'
+gmt_files_symbols <- list(
+  msigdb.h = paste0('./data/resources/MSigDB/', msigdb_vs, '/h.all.', msigdb_vs, '.symbols.gmt'),
+  msigdb.c2.cp.reactome = paste0('./data/resources/MSigDB/', msigdb_vs, '/c2.cp.reactome.', msigdb_vs, '.symbols.gmt'),
+  msigdb.c2.cp = paste0('./data/resources/MSigDB/', msigdb_vs, '/c2.cp.', msigdb_vs, '.symbols.gmt')
+)
+```
+
+## Data generation
+
+### Data wrangling
+
+Modify sample annotation
+```{r dw-coldata, eval = FALSE}
+colData(se) <- colData(se) %>% data.frame %>% 
+  mutate(
+    ## dormancy_brightness
+    dormancy_brightness = factor(dormancy_brightness,
+                                 levels = c('Bright',
+                                            'Mixed_dim_bright',
+                                            'Dim', 
+                                            'Mixed_dim_cycling', 
+                                            'Cycling', 
+                                            'Unk')),
+    dormancy_brightness = droplevels(dormancy_brightness),
+    ## check dormancy status
+    dormancy_check = ifelse(dormancy_check == 'no',
+                            'Regular',
+                            dormancy_check),
+    dormancy_check = ifelse(grepl('Picked_on_G_Floor_CC', dormancy_check),
+                            'Different microscope',
+                            dormancy_check),
+    dormancy_check = factor(dormancy_check) %>% relevel(ref = 'Regular'),
+    ## sample_type
+    sample_type_o=sample_type,
+    sample_type = gsub(";wbc|;dn", "", sample_type),
+    sample_type = factor(sample_type) %>% relevel(ref = 'dtc_single'),
+    #time_months
+    time_months = factor(time_months, levels = as.numeric(time_months) %>% unique %>% sort %>% as.character)
+  ) %>% 
+  DataFrame
+```
+
+Select only Bright, Dim and Cycling samples
+```{r dw-select-samples, eval = FALSE}
+se <- se[,se$dormancy_brightness %in% c('Bright', 'Dim', 'Cycling')]
+se$dormancy_brightness <- droplevels(se$dormancy_brightness)
+```
+
+Filtering out low-abundance features. Keeping those features with at least 10 counts in at least 70% of samples of the smallest group.
+```{r dw-subset-feature-abundance, eval = FALSE}
+use_rows <- filterByExpr(se, group=paste(se$sample_type, se$dormancy_brightness), min.count = 1, min.prop = 0.3)
+se <- se[use_rows,]
+
+# Update PerCellQCMetrics
+colData(se) <- colData(se) %>% data.frame %>% dplyr::select(-(sum:subsets_Ribo_percent)) %>% DataFrame
+se <- addPerCellQCMetrics(
+  se,
+  subsets=list(
+    Mito=which(rowData(se)$is.mito),
+    Ribo=which(rowData(se)$is.ribo)
+  ),
+  percent.top = c(1,5,10,20, 50, 100),
+  threshold = 3
+  )
+
+# # Table of removed features
+# table(use_rows) %>% 
+#   data.frame %>% 
+#   mutate(use_rows = ifelse(use_rows == TRUE, 'keep', 'remove')) %>% 
+#   column_to_rownames('use_rows') %>% 
+#   kbl(caption = 'Filtered features') %>%
+#   kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+Gene expression normalization
+```{r dw-tmm, eval = FALSE}
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(se, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+se$size_factor <- (norm_factors * lib_size)
+se <- logNormCounts(se, size.factors =se$size_factor)
+se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+
+assay(se, 'tpm') <- calculateTPM(se, assay.type = 'normcounts', rowData(se)$Length)
+
+assay(se, 'cpm') <- edgeR::cpm(assay(se, 'normcounts'))
+assay(se, 'logcpm') <- edgeR::cpm(assay(se, 'normcounts'), log = TRUE)
+```
+
+Cell cycle annotation with cyclone
+```{r dw-cc-cyclone, eval = FALSE}
+cc.pairs <- readRDS(system.file("exdata", "human_cycle_markers.rds", 
+    package="scran"))
+res <- cyclone(se, cc.pairs)
+se$cc_phase <- res$phases
+se$cc_g1_score <- res$normalized.scores$G1
+se$cc_s_score <- res$normalized.scores$S
+se$cc_g2m_score <- res$normalized.scores$G2M
+```
+
+Run [GSVA](https://www.bioconductor.org/packages/release/bioc/vignettes/GSVA/inst/doc/GSVA.html) with dormancy genes manually selected.
+```{r dw-gsva-dormancy-manual-genes, eval = FALSE}
+use_assay <- assay(se, 'logcpm')
+rownames(use_assay) <- make.names(rowData(se)$gene_name, unique = TRUE)
+
+use_gsets <- list(
+  `dormancy_ms_up` = dormancy_genes %>% filter(Direction == 'Up') %>% pull(gene_name) %>% unique,
+  `dormancy_ms_down` = dormancy_genes %>% filter(Direction == 'Down') %>% pull(gene_name) %>% unique
+)
+
+# Generate GSVA scores
+gsva_params <- gsvaParam(use_assay,
+                         use_gsets,
+                         kcdf="Gaussian",
+                         maxDiff = TRUE)
+
+res <- gsva(gsva_params)
+
+res <- res[, colnames(se)] %>% t()
+for(i in colnames(res)) {
+  colData(se)[,i]<- res[,i]
+}
+```
+
+Run [GSVA](https://www.bioconductor.org/packages/release/bioc/vignettes/GSVA/inst/doc/GSVA.html)  with MSigDb with p27 gene and related to senescence and negative regulation of cell cycle
+```{r dw-gsva-dormancy, eval = FALSE}
+use_assay <- assay(se, 'logcpm')
+rownames(use_assay) <- make.names(rowData(se)$gene_name, unique = TRUE)
+
+gset_c2 <- getGmt('./data/resources/MSigDB/v2026.1.Hs/c2.cp.v2026.1.Hs.symbols.gmt')
+gset_c5 <- getGmt('./data/resources/MSigDB/v2026.1.Hs/c5.go.bp.v2026.1.Hs.symbols.gmt')
+gset_c2cgp <- getGmt('./data/resources/MSigDB/v2026.1.Hs/c2.cgp.v2026.1.Hs.symbols.gmt')
+
+use_gsets <- list(
+  TOP_DEG_DOWN = c('CDC20','PSRC1','KIF20A','ASPM','HJURP','PTTG1','DLGAP5','TTK','FAM83D','AURKB','CENPE','CDCA3','ARHGAP11B','KNL1','PLK1','TROAP','SHCBP1','NUF2','TRAIP','KIF2C'),
+  BIOCARTA_P27_PATHWAY = geneIds(gset_c2[['BIOCARTA_P27_PATHWAY']]),
+  REACTOME_G0_AND_EARLY_G1 = geneIds(gset_c2[['REACTOME_G0_AND_EARLY_G1']]),
+  REACTOME_CELLULAR_SENESCENCE = geneIds(gset_c2[['REACTOME_CELLULAR_SENESCENCE']]),
+  REACTOME_MITOTIC_G1_PHASE_AND_G1_S_TRANSITION = geneIds(gset_c2[['REACTOME_MITOTIC_G1_PHASE_AND_G1_S_TRANSITION']]),
+  REACTOME_G1_S_SPECIFIC_TRANSCRIPTION = geneIds(gset_c2[['REACTOME_G1_S_SPECIFIC_TRANSCRIPTION']]),
+  GOBP_NEGATIVE_REGULATION_OF_MITOTIC_CELL_CYCLE = geneIds(gset_c5[['GOBP_NEGATIVE_REGULATION_OF_MITOTIC_CELL_CYCLE']]),
+  GOBP_NEGATIVE_REGULATION_OF_MITOTIC_CELL_CYCLE_PHASE_TRANSITION = geneIds(gset_c5[['GOBP_NEGATIVE_REGULATION_OF_MITOTIC_CELL_CYCLE_PHASE_TRANSITION']]),
+  GOBP_CELLULAR_SENESCENCE = geneIds(gset_c5[['GOBP_CELLULAR_SENESCENCE']]),
+  FRIDMAN_SENESCENCE_DN = geneIds(gset_c2cgp[['FRIDMAN_SENESCENCE_DN']]),
+  FRIDMAN_SENESCENCE_UP = geneIds(gset_c2cgp[['FRIDMAN_SENESCENCE_UP']]),
+  HVG_G1_S_TRANSCRIPTION = c('RRM2','CDK1','CDT1','CDC6','TK1','TYMS','CCNE1','E2F1','CDC45'),
+  `CA2+_Binding_proteins` = c('S100P', 'S100A14', 'S100A6', 'S100A16'),
+  `Genes_related_to_CA2+` = c('PSEN2', 'CRABP2', 'GSN', 'ANXA2', 'ANXA6', 'CIB1')
+)
+
+## ADD G0 from GO
+go_g0_names <- grep('G0', names(gset_c5), value = TRUE)
+for(i in go_g0_names){
+  use_gsets[[i]] <- geneIds(gset_c5[[i]])
+}
+
+# Generate GSVA scores
+gsva_params <- gsvaParam(use_assay,
+                         use_gsets,
+                         kcdf="Gaussian",
+                         maxDiff = TRUE)
+
+res <- gsva(gsva_params)
+
+res <- res[, colnames(se)] %>% t()
+for(i in colnames(res)) {
+  colData(se)[,i]<- res[,i]
+}
+
+```
+
+
+Save final SummarizedExperiment object after data wrangling and normalization
+```{r dw-save-se, eval = FALSE}
+saveRDS(se, file = file.path(params$output_dir, 'se.rds'))
+```
+
+Load SummarizedExperiment object after data wrangling and normalization
+```{r dw-load-se}
+se <- readRDS(file.path(params$output_dir, 'se.rds'))
+```
+
+### Hyerarchical clustering
+
+```{r recat-dge-brightness-config}
+p_thrs <- 0.001
+lfc_thrs <- 1
+i <- "bright-o-cycling"
+
+# Extract DGE results
+use_dge <- dge_list[[i]]$results %>% 
+  filter(FDR <= p_thrs & abs(logFC) >= lfc_thrs) %>% 
+  mutate(direction = ifelse(logFC > 0, 'Up', 'Down')) %>% 
+  arrange(FDR) %>% 
+  arrange(logFC)
+
+```
+
+Select genes for the analysis and generate matrix for clustering and exploratory analysis. We use the genes that are differentially expressed in Bright over Cycling samples, with FDR ≤ `r p_thrs`  and absolute log2 fold-change ≥ `r lfc_thrs` (n genes = `r nrow(use_dge)`). We scale the expression of these genes across samples to generate a matrix for clustering and exploratory analysis.
+
+```{r recat-dge-brightness-zmat}
+mat <- assay(se, 'logcounts')[rownames(use_dge), ]
+rownames(mat) <- make.names(use_dge$gene_name, unique = TRUE)
+zmat <- t(apply(mat, 1, scale, center = TRUE, scale = TRUE))
+colnames(zmat) <- colnames(mat)
+```
+
+
+Perform sample clustering and dendrogram. We cut the dendrogram to obtain the clusters.
+```{r recat-dge-brightness-hclust-dend, eval = FALSE}
+# Perform clustering and dendrogram
+dst <- t(zmat) %>% dist(method = 'euclidean')
+hc <-  dst %>% hclust(method = 'ward.D2')
+dend <- hc %>% as.dendrogram()
+column_dend<- dend
+
+
+## Find Clusters
+# clusters_original <- cutreeDynamic(hc, distM = as.matrix(dst),
+#                                    minClusterSize = 3, method="hybrid")
+clusters_original <- cutree(hc, k = 5)
+
+## Add clustering info to se
+# cluster_info_df <- data.frame(
+#   sample_alias = colnames(zmat),
+#   cluster = as.character(clusters_original) %>%
+#     factor(levels = c('4', '1', '5', '2', '3')),
+#   cluster_cycling = clusters_original %in% c('4', '1'),
+#   cluster_dormant = clusters_original %in% c('5', '2', '3')
+#   # cluster = factor(as.character(clusters_original))
+#   )
+
+cluster_info_df <- data.frame(
+  sample_alias = colnames(zmat),
+  # cluster = as.character(clusters_original),
+  cluster = case_when(
+    clusters_original == '1' ~ 'mVenus neg 1',
+    clusters_original == '2' ~ 'mVenus pos 2',
+    clusters_original == '3' ~ 'mVenus pos 1',
+    clusters_original == '4' ~ 'mVenus neg 2',
+    clusters_original == '5' ~ 'mVenus pos 3'
+  ),
+  cluster_cycling = clusters_original %in% c('4', '1'),
+  cluster_dormant = clusters_original %in% c('5', '2', '3')
+  # cluster = factor(as.character(clusters_original))
+  )
+
+```
+
+Save cluster information
+```{r recat-dge-brightness-hclust-save, eval = FALSE}
+cluster_info <- list(
+  cluster_info_df = cluster_info_df,
+  clusters_original = clusters_original,
+  dst = dst,
+  hc = hc,
+  dend = dend,
+  column_dend = column_dend 
+)
+saveRDS(cluster_info, file = file.path(params$output_dir, 'cluster_info.rds'))
+```
+
+Add cluster info to summarized experiment and generate colored dendrogram. 
+```{r recat-dge-brightness-hclust-to-se}
+cluster_info <- readRDS(file.path(params$output_dir, 'cluster_info.rds')) 
+if(!is.null(se$cluster))
+  se$cluster <- NULL
+colData(se) <- colData(se) %>% data.frame %>% 
+  left_join(cluster_info$cluster_info_df) %>% 
+  mutate(torownames = sample_alias) %>%
+  column_to_rownames('torownames') %>% 
+  DataFrame
+
+
+## Sort clusters to the order of the dendrogram:
+clusters <- cluster_info$clusters_original[order.dendrogram(cluster_info$dend)]
+clusters_numbers <- unique(clusters) - (0 %in% clusters)
+n_clusters <- length(clusters_numbers)
+cols <- rainbow_hcl(n_clusters)
+column_dend_colored <- cluster_info$dend %>% 
+         branches_attr_by_clusters(clusters, values = cols)
+```
+
+### Differential expression and functional enrichment
+```{r conf-comp}
+# Coldata
+x <- colData(se) %>% data.frame 
+
+# # Coldata for Bright and Dim samples only
+# xbd <- colData(se) %>% data.frame %>% 
+#   filter(dormancy_brightness %in% c('Bright', 'Dim'))
+
+comp_list <- list(
+  `Dormant--over--Cycling` = list(
+    Dormant = x %>% 
+      filter(cluster_dormant) %>% 
+      pull(sample_alias) %>% 
+      sort,
+    Cycling = x %>% 
+      filter(cluster_cycling) %>% 
+      pull(sample_alias) %>% 
+      sort
+  ),
+  `mVenus_pos_3--over--1-2` = list(
+    mVenus_pos_3 = x %>% 
+      filter(cluster == 'mVenus pos 3') %>% 
+      pull(sample_alias) %>% 
+      sort,
+    mVenus_pos_1_2 = x %>% 
+      filter(cluster %in% c('mVenus pos 1', 'mVenus pos 2')) %>% 
+      pull(sample_alias) %>% 
+      sort
+  ),
+  `mVenus_pos_2--over--1-3` = list(
+    mVenus_pos_2 = x %>% 
+      filter(cluster == 'mVenus pos 2') %>% 
+      pull(sample_alias) %>% 
+      sort,
+    mVenus_pos_1_3 = x %>% 
+      filter(cluster %in% c('mVenus pos 1', 'mVenus pos 3')) %>% 
+      pull(sample_alias) %>% 
+      sort
+  ),
+  `mVenus_pos_1--over--2-3` = list(
+    mVenus_pos_1 = x %>% 
+      filter(cluster == 'mVenus pos 1') %>% 
+      pull(sample_alias) %>% 
+      sort,
+    mVenus_pos_2_3 = x %>% 
+      filter(cluster %in% c('mVenus pos 2', 'mVenus pos 3')) %>% 
+      pull(sample_alias) %>% 
+      sort
+  )
+)
+
+
+comp_list_description <- data.frame(
+  comparison = names(comp_list),
+  comparison_long = c(
+    'Dormant over Cycling - cluster based',
+    'Cluster mVenus pos 3 over 1+2',
+    'Cluster mVenus pos 2 over 1+3',
+    'Cluster mVenus pos 1 over 2+3'
+  )
+)
+```
+
+Run differential expression analysis using EdgeR QLF
+```{r run-dge, eval = FALSE}
+ensembl <- biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description'),
+                              filters = 'external_gene_name',
+                              values = rowData(se)$gene_name, mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+
+use_comp <-  comp_list[[1]]
+dge_list <- foreach(use_comp = comp_list) %do%{
+  se_cols <- se$sample_alias %in% unlist(use_comp)
+  use_se <- se[,se_cols]
+  use_se$group <- ifelse(
+    use_se$sample_alias %in% use_comp[[1]],
+    names(use_comp)[1],
+    names(use_comp)[2]
+  )
+  
+  if(is.null(use_comp$batch)) {
+    dge <- edgeR_dge(
+      use_se,
+      # Design configuration for differential expression
+      group_var =  'group',
+      group_sample = names(use_comp)[1],
+      group_ref = names(use_comp)[2],
+      design_formula = "~ group",
+      coef = 'last',
+      # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+      assay_to_DGEList = 'counts',
+      assay_to_row_filter = "counts",
+      # Feature filtering parameters
+      use_filterByExpr = TRUE,
+      min_counts = params$min_counts,
+      min_present_prop = params$min_present_prop,
+      # EdgeR workflow configuration
+      run_calcNormFactors = 'TMM',
+      estimateDisp_robust = TRUE,
+      estimateDisp_trend.method = "locfit",
+      glm_approach = "QLF",
+      # Output configuration
+      adjust_method = 'BH'
+      )
+    } else if(use_comp$batch == 'donor') {
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        batch_vars = 'donor',
+        design_formula = "~ donor + group",
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+        )
+    }
+
+  use_res <- dge$results %>%  left_join(., gene_desc)
+  dge$results <- use_res %>% 
+    filter(!duplicated(feature)) %>% 
+    mutate(rownames = feature) %>% 
+    column_to_rownames('rownames')
+  
+   return(dge)
+}
+
+names(dge_list) <- names(comp_list)
+detach("package:biomaRt", unload=TRUE)
+# Save objects
+saveRDS(dge_list, file = file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+
+###########
+#   use_samples = NULL
+#   # Desing configuration for differential expression
+#   group_var = NULL
+#   group_sample = NULL
+#   group_ref = NULL
+#   numeric_covar = NULL
+#   batch_vars = NULL
+#   design_formula = NULL
+#   contrast = NULL
+#   coef = NULL
+#   # Conversion from SingleCellExpeiment to DGEList
+#   spike_normalization = FALSE
+#   assay_to_DGEList = 'counts'
+#   assay_to_row_filter = "tpm"
+#   use_colData = NULL
+#   use_rowData = NULL
+#   # Feature filtering parameters
+#   use_filterByExpr = TRUE
+#   min_counts = 1
+#   min_present_prop = 0.40
+#   # EdgeR workflow configuration
+#   run_calcNormFactors = 'TMM'
+#   estimateDisp_robust = FALSE
+#   estimateDisp_trend.method = "locfit"
+#   glmQLFit_robust = FALSE
+#   glm_approach = "QLF"
+#   # Output configuration
+#   adjust_method = 'BH'
+#   assays_from_SingleCellExperiment = NULL
+# 
+# object = se
+#     # Desing configuration for differential expression
+#     group_var =  condition_var
+#     group_sample = use_comp[1]
+#     group_ref = use_comp[2]
+#     batch_vars = 'sample_type'
+#     design_formula = paste("~ 0 +", condition_var," + sample_type")
+#     coef = NULL
+#     # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+#     assay_to_DGEList = 'counts'
+#     assay_to_row_filter = "counts"
+#     # Feature filtering parameters
+#     use_filterByExpr = TRUE
+#     min_counts = params$min_counts
+#     min_present_prop = params$min_present_prop
+#     # EdgeR workflow configuration
+#     run_calcNormFactors = 'TMM'
+#     estimateDisp_robust = FALSE
+#     estimateDisp_trend.method = "locfit"
+#     glm_approach = "QLF"
+#     # Output configuration
+#     adjust_method = 'BH'
+
+
+```
+
+Run functional enrichment
+```{r run-gse, eval = FALSE}
+library(org.Hs.eg.db)
+dge_list <- readRDS(file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+dge <-  dge_list[[1]]
+gse_list <- list()
+gse_list <- foreach(dge = dge_list) %do%{
+# for(dge_names in names(dge_list) ari) {
+  # dge <- dge_list[[dge_names]]
+  # cat('######', dge_names, "\n\n\n")
+  cat('####', dge$comparison, "\n\n\n")
+  # gse_list[[dge_names]] <- gse_omnibus(
+  gse_res <- gse_omnibus(
+    feature_names = dge$results$gene_name,
+    p = dge$results$FDR,
+    fc = dge$results$logFC,
+    fc_thrs = 0.5,
+    gmt_files = gmt_files_symbols,
+    
+    run_enricher = TRUE,
+    run_enrichGO = TRUE,
+    run_enrichKEGG = FALSE,
+    run_enrichReactome = TRUE,
+    
+    run_GSEA = TRUE,
+    run_gseGO = TRUE,
+    run_gseKEGG = FALSE,
+    run_gseReactome = TRUE,
+    
+    go_ontologies = c('BP'),
+    args_gse = list(
+      minGSSize = 10,
+      maxGSSize = 250,
+      pvalueCutoff = 1),
+    args_enricher = list(
+      minGSSize = 10,
+      maxGSSize = 250, 
+      pvalueCutoff = 1),
+    go_simplify = TRUE,
+    go_simplify_p = 0.1,
+    go_simplify_cutoff = 0.6
+    )
+  
+   return(gse_res)
+
+}
+names(gse_list) <- names(dge_list)
+
+# Save objects
+saveRDS(gse_list, file = file.path(params$output_dir,'gse_omnibus-edgeR_QLF.rds'))
+```
+
+Load differential expression and functional enrichment results
+```{r load-dge-gse}
+dge_list <- readRDS(file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+gse_list <- readRDS(file.path(params$output_dir, 'gse_omnibus-edgeR_QLF.rds'))
+```
+
+## Sample clustering
+```{r recat-dge-brightness-hclust-dend-plot, fig.width=7.2}
+cluster_info <- readRDS(file.path(params$output_dir, 'cluster_info.rds')) 
+
+
+## Sort clusters to the order of the dendrogram:
+clusters <- cluster_info$clusters_original[order.dendrogram(cluster_info$dend)]
+clusters_numbers <- unique(clusters) - (0 %in% clusters)
+n_clusters <- length(clusters_numbers)
+# cols <- rainbow_hcl(n_clusters)
+cols <- cluster_palette
+column_dend_colored <- cluster_info$dend %>% 
+         branches_attr_by_clusters(clusters, values = cols)
+
+## Define column annotation colors
+use_annot_var <- se$dormancy_brightness %>%
+  as.character
+annot_color <- palette_dormancy_brightness[use_annot_var]
+
+# Gnerate cluster palette for heatmap column annotation
+# cluster_palette <- cols %>% set_names(unique(clusters))
+# Plot colored dendrogram
+plot(column_dend_colored)
+colored_bars(colors = annot_color, dend = column_dend_colored, rowLabels = "Brightness")
+```
+
+## PCA
+```{r recat-dge-brightness-pca-conf}
+ann_df <- colData(se) %>% data.frame %>% 
+  dplyr::select(
+    detected,
+    sum,
+    dormancy_check,
+    dormancy_brightness,
+    centrifugation_g,
+    time_months,
+    anatomical_origin,
+    sample_type,
+    dormancy_status,
+    mouse_id,
+    cluster)
+
+mat <- assay(se, 'logcounts')[rownames(use_dge), ]
+
+p <- PCAtools::pca(mat, 
+                   metadata = ann_df[colnames(mat),]
+                   )
+```
+
+#### Variable correlation
+Plot showing the correlation of PCs with sample-level variables. 
+```{r recat-dge-brightness-pca-eigencor-plot, fig.width = 7.2}
+n_pc <- 1:5
+
+eigencor_res <- eigencorval(p,components = getComponents(p, n_pc), metavars = colnames(p$metadata))
+
+# Select variables correlated with PC1 and PC2
+col_vars <- colnames(eigencor_res$pvals)
+col_pc12 <- c(
+  col_vars[eigencor_res$pvals['PC1',]<0.05],
+  col_vars[eigencor_res$pvals['PC2',]<0.05]
+)
+
+# Plot correlation
+eigencorplot(p,
+             components = getComponents(p, n_pc),
+             metavars = colnames(p$metadata),
+             # col = c('darkblue', 'blue2', 'black', 'red2', 'darkred'),
+             # col = c('gold', 'cornsilk1', 'white', 'forestgreen', 'darkgreen'),
+             # colCorval = 'white',
+             fontCorval = 2,
+             main = 'PC sample variables correlation')
+
+
+```
+
+#### Bi-plot
+```{r recat-dge-brightness-pca-pc1-pc2-plot, fig.asp=0.8, fig.width = 7.2}
+i <- 'dormancy_brightness'
+PCAtools::biplot(
+  p, 
+  colby = i, 
+  colkey = palette_dormancy_brightness,
+  colLegendTitle = i,
+  shape = 'sample_type',
+  shapeLegendTitle = 'Sample Type',
+  # encircle = use_encircle,
+  # encircleAlpha = 1/4,
+  legendPosition = 'right',
+  pointSize = 3,
+  lab = NULL
+  # loadings parameters
+  # showLoadings = TRUE,
+  # lengthLoadingsArrowsFactor = 1.5,
+  # elipse config
+  # ellipse = use_ellipse,
+  # ellipseType = 't',
+  # ellipseLevel = 0.75
+) +
+  theme_facet
+```
+
+```{r recat-dge-brightness-pca-pc1-pc2-plot-hclust, fig.asp=0.8, fig.width = 3.2}
+i <- 'cluster'
+PCAtools::biplot(
+  p, 
+  colby = i, 
+  colkey = cluster_palette,
+  colLegendTitle = i,
+  
+  shape = 'dormancy_brightness',
+  shapeLegendTitle = 'Fluorescence',
+  # encircle = use_encircle,
+  # encircleAlpha = 1/4,
+  legendPosition = 'right',
+  pointSize = 1,
+  lab = NULL, 
+
+  # elipse config
+  ellipse = TRUE,
+  ellipseType = 't',
+  ellipseLevel = 0.90
+) +
+  theme_project
+
+
+
+```
+
+```{r recat-dge-brightness-pca-pc1-pc2-plot-hclust-ggplot, fig.asp=0.8, fig.width = 3.2}
+cbind(p$metadata, p$rotated[,1:2]) %>% 
+  ggplot(aes(x = PC1, y = PC2, color = cluster, shape = dormancy_brightness)) +
+  geom_point(size = 2, alpha = 0.75) +
+  scale_color_manual(values = cluster_palette) +
+  
+  labs(
+    shape = 'Fluorescence',
+    color = 'Cluster',
+    x = paste("PC\n", round(p$var[1], 2), "% variation", sep = ""),
+    y = paste("PC\n", round(p$var[2], 2), "% variation", sep = "")
+  )
+
+
+cbind(p$metadata, p$rotated[,1:2]) %>% 
+  ggplot(aes(x = PC1, y = PC2, color = time_months, shape = dormancy_brightness)) +
+  geom_point(size = 5, alpha = 1) +
+  # scale_color_manual(values = cluster_palette) +
+  
+  labs(
+    shape = 'Fluorescence',
+    color = 'Cluster',
+    x = paste("PC\n", round(p$var[1], 2), "% variation", sep = ""),
+    y = paste("PC\n", round(p$var[2], 2), "% variation", sep = "")
+  )
+
+```
+
+## Heatmap unsupervised clustering
+Generate heatmap with pre-defined dendrogram and clustering
+```{r recat-dge-brightness-heatmap-hclust-heatmap, fig.width=7.8, fig.asp = 1.6}
+max_color_range <- 3
+
+# Column Annotation
+use_annot <-  colData(se) %>% data.frame %>% 
+  dplyr::select(dormancy_brightness, 
+                cluster
+                # sample_type,
+                # ctc_n,
+                # time_months,
+                # anatomical_origin,
+                # centrifugation_g
+                ) %>% 
+  dplyr::select(cluster, everything()) %>% 
+  dplyr::rename(
+    Condition = dormancy_brightness,
+    Cluster = cluster
+    # `DTC type` = sample_type,
+    # `DTC cells` = ctc_n,
+    # `Time (m)` = time_months,
+    # `Site` = anatomical_origin,
+    # `Centrifugation (g)` = centrifugation_g
+  )
+use_annot <- use_annot[colnames(zmat),]
+  
+palette_ctc_n <- colorRamp2(
+  c(1, max(use_annot$`DTC cells`)), 
+  c("#ccece6", "#006d2c")
+  )
+column_ha <-  HeatmapAnnotation(
+  df = use_annot,
+  col = list(
+    Condition = palette_dormancy_brightness[levels(use_annot$Condition)],
+    Cluster = cluster_palette
+    # `DTC type` = palette_sample_type,
+    # `Time (m)` = palette_time,
+    # `Site` = palette_anatomy,
+    # `Centrifugation (g)` = palette_centrifucation
+  ),
+  annotation_name_gp = gpar(fontsize = 8),
+  annotation_name_side = 'left'
+)
+
+
+# Row annotation (right)
+row_annot_right <-  rowAnnotation(
+  log2FC = anno_numeric(
+    round(use_dge$logFC,1), 
+    labels_gp = gpar(fontsize = 6),
+    bg_gp = gpar(
+      fill = c("#74add1", "#f46d43"), 
+      col = 'white'
+    ),
+    bar_width = unit(1, "npc") - unit(1.5, "pt")
+  ), 
+  annotation_name_rot = 0)
+
+
+# Row annotation (left)
+direction_palette <- c('Up' = "#f46d43", 'Down' = "#74add1")
+direction_palette <- direction_palette[names(direction_palette) %in% use_dge$direction]
+
+row_annot_left <-  rowAnnotation(
+  direction = anno_block(
+    gp = gpar(fill = direction_palette),
+    labels = names(direction_palette), 
+    labels_gp = gpar(col = "white", fontsize = 8)
+  )
+)
+
+
+# Heatmap color
+zmax <- zmat %>% abs %>% max
+if(!is.null(max_color_range))
+  zmax <- max_color_range
+col_fun <-  colorRamp2(
+  seq(-zmax, zmax, length.out = 11),
+  rev(brewer.pal(11, "RdBu"))
+)
+
+# Generate Heatmap
+htz <- Heatmap(
+  zmat,
+  name= 'z-score',
+  col = col_fun,
+  
+  row_names_gp = gpar(fontsize = 6),
+  # column_names_gp = gpar(fontsize = 8),
+  show_column_names = FALSE,
+  
+  top_annotation = column_ha,
+  cluster_columns = column_dend_colored,
+  column_title = NULL,
+  
+  show_row_dend = FALSE,
+  column_split = 2,
+
+  row_title = NULL
+)
+
+
+draw(htz, 
+     annotation_legend_side = "bottom"
+)
+cat("\n\n")
+```
+
+Generate heatmap split by sorted clusters
+```{r recat-dge-brightness-heatmap-hclust-sorted-heatmap, fig.width=7.8, fig.asp = 1.6}
+# Generate Heatmap
+htz <- Heatmap(
+  zmat,
+  name= 'z-score',
+  col = col_fun,
+  row_names_gp = gpar(fontsize = 6),
+  # column_names_gp = gpar(fontsize = 8),
+  show_column_names = FALSE,
+  
+  top_annotation = column_ha,
+  # cluster_columns = column_dend_colored,
+  clustering_method_columns = 'ward.D2',
+  column_split = factor(use_annot$Cluster, levels = c("mVenus neg 2", "mVenus neg 1", "mVenus pos 3", "mVenus pos 2", "mVenus pos 1")),
+  cluster_column_slices = FALSE,
+  column_title = NULL,
+  
+  
+  show_row_dend = FALSE,
+
+  row_title = NULL
+)
+
+
+draw(htz, 
+     # heatmap_legend_side = "bottom", 
+     annotation_legend_side = "bottom"
+)
+cat("\n\n")
+```
+
+
+## Clusters analysis
+```{r recatdge-brightness-cluster-analysis}
+my_comparisons <- list(
+  c("1", "4"),
+  c("1", "3"),
+  c("1", "5"),
+  c("1", "2")
+)
+    
+```
+
+### Vector expression by cluster
+```{r recat-dge-brightness-vector-exp}
+use_data <- colData(se) %>% data.frame
+use_data$vector <- assay(se, 'logcounts')[params$vector_dorm,]
+
+use_data %>% 
+  ggplot(aes(cluster, vector, fill = cluster)) +
+  geom_violin(width=0.9, scale = 'width', linewidth = rel(0.4)) +
+  stat_summary(data = use_data %>% filter(dormancy_status!='mixed_dormant'),
+               fun.data="median_q1q3", 
+               mult=1, 
+               geom="crossbar", 
+               width=0.08, 
+               color = alpha('black', alpha = 1),
+               fill = 'white'
+               ) +
+  # geom_jitter(shape=16, width=0.1, alpha = 0.8, show.legend = FALSE) +
+  # geom_dotplot(shape=16, binaxis='y', stackdir='center', dotsize=0.9, alpha = 0.8) +
+  geom_quasirandom(shape = 16, alpha = 0.5, width=0.25, size = rel(0.8)) +
+  scale_fill_manual(values = cluster_palette) +
+  labs(
+    x = 'Clusters',
+    y = paste(params$vector_dorm, "expression"),
+    fill = '',
+    caption = paste(
+      'Y-axis: normalized expression in log scale',
+      'Points represent individual observations',
+      'Box represent Q25, median and Q75',
+      sep = '\n'
+    )
+  ) + 
+  guides(fill = 'none') +
+  # theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+  stat_compare_means(
+    comparisons = my_comparisons,
+    label.y.npc = 1,
+    label.x.npc = 'left',
+    size = 0.8*geom_text_size
+    )
+  cat("\n\n")
+
+```
+
+### Phenotype and quality variables
+```{r recat-dge-brightness-pheno-exp}
+chunk_data <- colData(se) %>% data.frame %>% 
+  mutate(
+    time_months = as.character(time_months) %>% as.numeric,
+    `log (N reads)` = log(sum)
+    )
+
+test_var <- c('log (N reads)', 'detected', 
+              'time_months', 'ctc_n',
+              'subsets_Mito_percent', 
+              'subsets_Mito_detected',
+              'subsets_Ribo_percent', 
+              'subsets_Ribo_detected'
+              ) 
+
+for (i in test_var) {
+  res <- chunk_data %>% 
+    ggplot(aes(cluster, .data[[i]], fill = cluster)) +
+    geom_violin(width=0.9, scale = 'width', linewidth = rel(0.4)) +
+    stat_summary(data = chunk_data %>% filter(!dormancy_status %in% c('Mixed', 'Unk')),
+                 fun.data="median_q1q3", 
+                 mult=1, 
+                 geom="crossbar", 
+                 width=0.08, 
+                 color = alpha('black', alpha = 1),
+                 fill = 'white'
+                 ) +
+    geom_quasirandom(shape = 16, alpha = 0.5, width=0.25, size = rel(0.8)) +
+    scale_fill_manual(values = cluster_palette) +
+    labs(
+      title = i,
+      x = 'Clusters',
+      y = i,
+      fill = '',
+      caption = paste(
+        'Y-axis: normalized expression in log scale',
+        'Points represent individual observations',
+        'Box represent Q25, median and Q75',
+        sep = '\n'
+      )
+    ) + 
+    guides(fill = 'none') +
+    scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+    stat_compare_means(
+      comparisons = my_comparisons,
+      label.y.npc = 1,
+      label.x.npc = 'left',
+      size = 0.8*geom_text_size
+      )
+  print(res)
+  cat("\n\n")
+}
+```
+
+### Cell cycle scores
+```{r recat-dge-brightness-ccs-exp}
+chunk_data <- colData(se) %>% data.frame
+
+test_var <- c('cc_g1_score', 'cc_s_score', 'cc_g2m_score') 
+
+for (i in test_var) {
+  res <- chunk_data %>% 
+    ggplot(aes(cluster, .data[[i]], fill = cluster)) +
+    geom_violin(width=0.9, scale = 'width', linewidth = rel(0.4)) +
+    stat_summary(data = chunk_data %>% filter(!dormancy_status %in% c('Mixed', 'Unk')),
+                 fun.data="median_q1q3", 
+                 mult=1, 
+                 geom="crossbar", 
+                 width=0.08, 
+                 color = alpha('black', alpha = 1),
+                 fill = 'white'
+                 ) +
+    geom_quasirandom(shape = 16, alpha = 0.5, width=0.25, size = rel(0.8)) +
+    scale_fill_manual(values = cluster_palette) +
+    labs(
+      title = gsub("_score", "", i) %>% gsub("cc_", "", .) %>% toupper,
+      x = 'Clusters',
+      y = i,
+      fill = '',
+      caption = paste(
+        'Y-axis: normalized expression in log scale',
+        'Points represent individual observations',
+        'Box represent Q25, median and Q75',
+        sep = '\n'
+      )
+    ) + 
+    guides(fill = 'none') +
+    scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+    stat_compare_means(
+      comparisons = my_comparisons,
+      label.y.npc = 1,
+      label.x.npc = 'left',
+      size = 0.8*geom_text_size
+      )
+  print(res)
+  cat("\n\n")
+}
+```
+
+```{r cc-score-dormancy-scatterplot}
+colData(se) %>% data.frame %>% 
+  ggplot(aes(cc_g1_score, cc_g2m_score, color = cluster)) +
+  geom_point(shape = 16, size = rel(2), alpha = 0.5) +
+  geom_hline(yintercept = 0.5, linetype = 2) +
+  geom_vline(xintercept = 0.5, linetype = 2) +
+  scale_color_manual(values =  cluster_palette) +
+  labs(
+    x = 'G1 score',
+    y = 'G2M score',
+    color = '',
+    caption = 'Cells are classified as being in G1 phase if the G1 score is above 0.5 and greater than the G2/M score; in G2/M phase if the G2/M score is above 0.5 and greater than the G1 score; and in S phase if neither score is above 0.5.'
+  )
+
+```
+
+### Cell cycle phase
+```{r cc-phase-brightness-barplot}
+chunk_data <- colData(se) %>% data.frame %>% 
+  group_by(cluster, cc_phase) %>% 
+  summarise(n = n()) %>% 
+  ungroup()
+chunk_data$p <- chunk_data %>% 
+  reframe(
+    p = n / sum(n), 
+    .by = cluster) %>% 
+  pull(p)
+
+chunk_data %<>%  arrange(cluster, p)
+chunk_data$pos <- chunk_data %>% 
+  reframe(
+    pos =  cumsum(p) - (0.5 * p), 
+    .by = cluster) %>% 
+  pull(pos)
+
+chunk_data %>% 
+  ggplot(aes(cluster, p, fill = cc_phase)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(
+    label = paste0(round(100*p, 1),"%"),
+    y = pos), 
+    size=geom_text_size) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_OkabeIto() +
+  labs(
+    x = '',
+    y = 'Percentage',
+    fill = ''
+  )
+```
+
+### Dormancy gene sets
+```{r recat-dge-brightness-gsva-exp}
+chunk_data <- colData(se) %>% data.frame
+test_var <- chunk_data %>% 
+  dplyr::select(dormancy_ms_up:GOBP_POSITIVE_REGULATION_OF_G0_TO_G1_TRANSITION) %>% 
+  colnames()
+
+for (i in test_var) {
+  res <- chunk_data %>% 
+    ggplot(aes(cluster, .data[[i]], fill = cluster)) +
+    geom_violin(width=0.9, scale = 'width', linewidth = rel(0.4)) +
+    stat_summary(data = chunk_data %>% filter(!dormancy_status %in% c('Mixed', 'Unk')),
+                 fun.data="median_q1q3", 
+                 mult=1, 
+                 geom="crossbar", 
+                 width=0.08, 
+                 color = alpha('black', alpha = 1),
+                 fill = 'white'
+                 ) +
+    geom_quasirandom(shape = 16, alpha = 0.5, width=0.25, size = rel(0.8)) +
+    scale_fill_manual(values = cluster_palette) +
+    labs(
+      title = i,
+      x = 'Clusters',
+      y = 'GSVA score',
+      fill = '',
+      caption = paste(
+        'Y-axis: normalized expression in log scale',
+        'Points represent individual observations',
+        'Box represent Q25, median and Q75',
+        sep = '\n'
+      )
+    ) + 
+    guides(fill = 'none') +
+    scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+    theme(
+      plot.title = element_text(size = 6),
+    ) +
+    stat_compare_means(
+      comparisons = my_comparisons,
+      label.y.npc = 1,
+      label.x.npc = 'left',
+      size = 0.8*geom_text_size
+      )
+  print(res)
+  cat("\n\n")
+}
+```
+
+### Cyclins
+#### Heatmap
+```{r recat-dge-brightness-cyclins-heatmap, fig.width=7.8, fig.asp = 0.8}
+cyclin_genes <- grep("^CCN[ABCDE][0-9]$", rowData(se)$gene_name)
+# Extract matrix of expression
+cc_mat <- assay(se, 'logcounts')[cyclin_genes, ]
+rownames(cc_mat) <- rowData(se)[cyclin_genes, ]$gene_name
+cc_zmat <- t(apply(cc_mat, 1, scale, center = TRUE, scale = TRUE))
+colnames(cc_zmat) <- colnames(cc_mat)
+
+# Generate Heatmap
+htz <- Heatmap(
+  cc_zmat,
+  name= 'z-score',
+  col = col_fun,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 8),
+  
+  top_annotation = column_ha,
+  # cluster_columns = column_dend_colored,
+  clustering_method_columns = 'ward.D2',
+  column_split = use_annot$Cluster,
+  cluster_column_slices = FALSE,
+  column_title = NULL
+)
+
+
+draw(htz, 
+     # heatmap_legend_side = "bottom", 
+     annotation_legend_side = "bottom"
+)
+```
+
+#### Distribution
+```{r recat-dge-brightness-cyclins-exp}
+cyclin_genes <- grep("^CCN[ABCDE][0-9]$", rowData(se)$gene_name)
+use_data <- colData(se) %>% data.frame
+i <- cyclin_genes[1]
+for(i in cyclin_genes) {
+  use_data$gene_exp <- assay(se, 'logcounts')[i, ]
+  gene_name <- rowData(se)[i, ]$gene_name
+  res <- use_data %>% 
+    ggplot(aes(cluster, gene_exp, fill = cluster)) +
+    geom_violin(width=0.9, scale = 'width', linewidth = rel(0.4)) +
+    stat_summary(data = use_data %>% filter(dormancy_status!='mixed_dormant'),
+                 fun.data="median_q1q3", 
+                 mult=1, 
+                 geom="crossbar", 
+                 width=0.08, 
+                 color = alpha('black', alpha = 1),
+                 fill = 'white'
+                 ) +
+    # geom_jitter(shape=16, width=0.1, alpha = 0.8, show.legend = FALSE) +
+    # geom_dotplot(shape=16, binaxis='y', stackdir='center', dotsize=0.9, alpha = 0.8) +
+    geom_quasirandom(shape = 16, alpha = 0.5, width=0.25, size = rel(0.8)) +
+    scale_fill_manual(values = cluster_palette) +
+    labs(
+      title = gene_name,
+      x = 'Clusters',
+      y = paste(gene_name, "expression"),
+      fill = '',
+      caption = paste(
+        'Y-axis: normalized expression in log scale',
+        'Points represent individual observations',
+        'Box represent Q25, median and Q75',
+        sep = '\n'
+      )
+    ) + 
+    guides(fill = 'none') +
+    # theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+    stat_compare_means(
+      comparisons = my_comparisons,
+      label.y.npc = 1,
+      label.x.npc = 'left',
+      size = 0.8*geom_text_size
+      )
+  print(res)
+  cat("\n\n")
+
+}
+
+```
+
+
+
+
+
+## Differential expression analysis
+```{r knitr-template-rnaseq-deg-edger, eval = TRUE}
+se$condition <- se$dormancy_brightness
+group_palette <- get_scater_palette('tableau10medium')[1:nlevels(se$condition)] %>% 
+  set_names(levels(se$condition))
+
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-deg-edger.Rmd")
+  )
+```
+`r knit(text = src)`
+
+## Functional enrichment analysis
+```{r knitr-template-rnaseq-gse-omnibus, eval = TRUE}
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-gse-omnibus.Rmd")
+  )
+```
+`r knit(text = src)`
+
+
+

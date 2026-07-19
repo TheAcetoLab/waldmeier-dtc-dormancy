@@ -1,0 +1,192 @@
+---
+title: "Analysis of timeseries of DTC counts"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  data: ./data/external/experiments/timeseries_dtc_counts.xlsx
+---
+  
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+# library(showtext)
+# library(foreach)
+# library(DT)
+library(knitr)
+library(magrittr)
+library(kableExtra)
+# library(cowplot)
+# library(colorblindr)
+# library(ggbeeswarm)
+# library(arsenal)
+# library(patchwork)
+library(openxlsx)
+library(ggbeeswarm)
+library(scales)
+
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Prepare color palettes
+```{r color-palettes}
+vector_palette <- c(mVenus = '#109939', mCherry = '#e4017d')
+```
+
+## Analysis of Br16
+
+Load and process data
+```{r load-dw-br16}
+data <- read.xlsx(params$data, sheet = 'Br16')
+data %<>% 
+  dplyr::select(mouse_id, mVenus_pos_norm, mVenus_neg_norm, time_months) %>% 
+  dplyr::rename(n_dtc_positive = mVenus_pos_norm, n_dtc_negative = mVenus_neg_norm, subject = mouse_id, time = time_months) %>% 
+  mutate(
+    total_dtcs = n_dtc_positive + n_dtc_negative,
+    prop_positive = ifelse(total_dtcs > 0, n_dtc_positive / total_dtcs, NA)
+  )
+```
+
+### Data analysis including 0 counts
+
+
+Keeping rows with 0 total DTCs can be informative if we want to understand the overall trend of mVenus+ DTCs over time, including the cases where there are no DTCs. However, it is important to handle these cases appropriately in the analysis and visualization, as they can lead to a large number of zero proportions that may not be meaningful for understanding the relationship between time and the Percentage of mVenus+ DTCs. In this case, we will keep the rows with 0 total DTCs but we will set the Percentage of mVenus+ DTCs to 0 for these cases, which allows us to include them in the analysis without distorting the visualization or the fitted model.
+
+```{r glm-keep0-conf-br16}
+use_data <- data %>% mutate(prop_positive = ifelse(is.na(prop_positive), 0, prop_positive))
+```
+
+```{r glm-keep0-bubble_plot-br16}
+ggplot(use_data, aes(x = time, y = prop_positive)) +
+  # geom_point(aes(size = total_dtcs), alpha = 0.6, color = vector_palette[['mVenus']]) + # Bubble size represents total cells
+  geom_beeswarm(aes(size = total_dtcs), alpha = 0.6, color = vector_palette[['mVenus']]) + # Bubble size represents total cells
+  geom_smooth(aes(weight = total_dtcs), method = "glm", 
+              method.args = list(family = "binomial"), 
+              color = "red", se = TRUE) +
+  scale_x_continuous(breaks = use_data$time %>% unique) +
+  labs(
+    title = "Percentage of mVenus+ DTCs",
+    x = "Time",
+    y = "Percentage of mVenus+ DTCs",
+    size = "Total DTCs",
+    caption = "Proportion calculated over the\ntotal number of DTCs (mVenus+ and mVenus-)"
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+
+```
+
+Statistical analysis. Here we use a Generalized Linear Model (GLM) with a binomial error distribution and logit link function to model the relationship between time and the counts of positive and negative DTCs. This is much more robust statistically than running a linear regression on the calculated proportions, because the Binomial GLM inherently understands that a proportion of 50/100 carries much more statistical weight than a proportion of 1/2.
+```{r glm-keep0-glm-br16}
+model <- glm(cbind(n_dtc_positive, n_dtc_negative) ~ time, 
+             data = use_data, 
+             family = binomial(link = "logit"))
+
+# summary(model)
+broom::tidy(model) %>% 
+  mutate(
+    OR = exp(estimate),
+    p.value = format.pval(p.value, digits = 3)
+  ) %>% 
+  dplyr::select(term, OR, estimate, std.error, statistic, p.value) %>% 
+  kbl(caption = 'GLM results', align = "lrrrrr") %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+
+
+
+## Analysis of 1833
+
+Load and process data
+```{r load-dw-1833}
+data <- read.xlsx(params$data, sheet = '1833')
+data %<>% 
+  dplyr::select(mouse_id, mCherry_pos_norm, mCherry_neg_norm, time_months) %>% 
+  dplyr::rename(n_dtc_positive = mCherry_pos_norm, n_dtc_negative = mCherry_neg_norm, subject = mouse_id, time = time_months) %>% 
+  mutate(
+    total_dtcs = n_dtc_positive + n_dtc_negative,
+    prop_positive = ifelse(total_dtcs > 0, n_dtc_positive / total_dtcs, NA)
+  )
+```
+
+
+### Data analysis including 0 counts
+
+
+Keeping rows with 0 total DTCs can be informative if we want to understand the overall trend of mCherry+ DTCs over time, including the cases where there are no DTCs (Proportion = 0). However, it is important to handle these cases appropriately in the analysis and visualization, as they can lead to a large number of zero proportions that may not be meaningful for understanding the relationship between time and the Percentage of mCherry+ DTCs. In this case, we will keep the rows with 0 total DTCs but we will set the Percentage of mCherry+ DTCs to 0 for these cases, which allows us to include them in the analysis without distorting the visualization or the fitted model.
+
+```{r glm-keep0-conf-1833}
+use_data <- data %>% mutate(prop_positive = ifelse(is.na(prop_positive), 0, prop_positive))
+```
+
+```{r glm-keep0-bubble_plot-1833}
+ggplot(use_data, aes(x = time, y = prop_positive)) +
+  # geom_point(aes(size = total_dtcs), alpha = 0.6, color = vector_palette[['mCherry']]) + # Bubble size represents total cells
+  geom_beeswarm(aes(size = total_dtcs), alpha = 0.6, color = vector_palette[['mCherry']]) + # Bubble size represents total cells
+  geom_smooth(aes(weight = total_dtcs), method = "glm", 
+              method.args = list(family = "binomial"), 
+              color = "red", se = TRUE) +
+  scale_x_continuous(breaks = use_data$time %>% unique) +
+  labs(
+    title = "Percentage of mCherry+ DTCs",
+    x = "Time",
+    y = "Percentage of mCherry+ DTCs",
+    size = "Total DTCs",
+    caption = "Proportion calculated over the\ntotal number of DTCs (mCherry+ and mCherry-)"
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+
+```
+
+Statistical analysis. Here we use a Generalized Linear Model (GLM) with a binomial error distribution and logit link function to model the relationship between time and the counts of positive and negative DTCs. This is much more robust statistically than running a linear regression on the calculated proportions, because the Binomial GLM inherently understands that a proportion of 50/100 carries much more statistical weight than a proportion of 1/2.
+```{r glm-keep0-glm-1833}
+model <- glm(cbind(n_dtc_positive, n_dtc_negative) ~ time, 
+             data = use_data, 
+             family = binomial(link = "logit"))
+
+# summary(model)
+broom::tidy(model) %>% 
+  mutate(
+    OR = exp(estimate),
+    p.value = format.pval(p.value, digits = 3)
+  ) %>% 
+  dplyr::select(term, OR, estimate, std.error, statistic, p.value) %>% 
+  kbl(caption = 'GLM results', align = "lrrrrr") %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+

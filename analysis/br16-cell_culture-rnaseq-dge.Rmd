@@ -1,0 +1,423 @@
+---
+title: "Differential gene expression of BR16 dox treated samples"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  data_dir: ./output/rnaseq/br16_bulk
+  output_dir: ./output/rnaseq/br16_bulk/dge
+  se_file: se_gene.rds
+  min_counts: 3
+  min_present_prop: 0.70
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(ggpubr)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/eigencorval.R')
+source('./code/R-functions/subchunkify.R')
+source('./code/R-functions/pairwise_terms_jc.r')
+
+clean_msigdb_names <- function(x) x %>% gsub('REACTOME_', '', .) %>% gsub('WP_', '', .) %>% gsub('BIOCARTA_', '', .) %>% gsub('KEGG_', '', .) %>% gsub('PID_', '', .) %>% gsub('GOBP_', '', .) %>% gsub('_', ' ', .)
+```
+
+Define additional functions
+```{r add-functions}
+clean_sample_alias <- function(x) 
+  gsub('o[0-9]*_[0-9]*-|_gDNA.*', '', x) %>% gsub(".*-MS", "MS", .) %>% gsub("_S[0-9]+_R[0-9].*", "", .) %>% gsub('__STARpass1', '', .) %>% gsub(".k2report", "", .) %>% gsub(".*-|.disambiguated.*", "", .)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Configuration for functional enrichment
+```{r conf-gse_omnbus}
+msigdb_vs <- 'v2026.1.Hs'
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0('./data/resources/MSigDB/', msigdb_vs, '/c2.cp.', msigdb_vs, '.symbols.gmt'),
+  msigdb.c2.cp.reactome = paste0('./data/resources/MSigDB/', msigdb_vs, '/c2.cp.reactome.', msigdb_vs, '.symbols.gmt')
+)
+```
+
+Load list of dormancy genes
+```{r load-dormancy-genes}
+dormancy_genes <- read_csv(file = './data/resources/list_of_dormancy_genes_MS_20230823.csv')
+dormancy_genes_ar <- read_csv(file = './data/resources/list_of_dormancy_genes_AR_20231201.tsv.txt') %>% pull('Gene')
+```
+
+
+Load data
+```{r load-data}
+se <- readRDS(file.path(params$data_dir, paste0(params$se_file)))
+```
+
+
+
+## Configure analyses
+
+### Data wrangling
+
+Filtering out low-abundance features. Keeping those features with at least 10 counts in at least 70% of samples of the smallest group.
+```{r dw-subset-feature-abundance}
+use_rows <- filterByExpr(se, group=se$condition, min.count = 1, min.prop = 0.3)
+se <- se[use_rows,]
+
+# Update PerCellQCMetrics
+colData(se) <- colData(se) %>% data.frame %>% dplyr::select(-(sum:subsets_Ribo_percent)) %>% DataFrame
+se <- addPerCellQCMetrics(
+  se,
+  subsets=list(
+    Mito=which(rowData(se)$is.mito),
+    Ribo=which(rowData(se)$is.ribo)
+  ),
+  percent.top = c(1,5,10,20, 50, 100),
+  threshold = 3
+  )
+
+# # Table of removed features
+# table(use_rows) %>% 
+#   data.frame %>% 
+#   mutate(use_rows = ifelse(use_rows == TRUE, 'keep', 'remove')) %>% 
+#   column_to_rownames('use_rows') %>% 
+#   kbl(caption = 'Filtered features') %>%
+#   kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+TMM normalization
+```{r dw-tmm}
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(se, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+se$size_factor <- (norm_factors * lib_size)
+se <- logNormCounts(se, size.factors =se$size_factor)
+se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+```
+
+### Define a list of comparisons
+```{r conf-comparisons}
+x <- colData(se) %>% data.frame
+
+comp_list <- list(
+  `p27-wt-96` = list(
+    p27 = x %>% 
+      filter(condition == 'p27_96h') %>% 
+      pull(sample_alias) %>% 
+      sort,
+    wt = x %>% 
+      filter(condition == 'WT_96h') %>% 
+      pull(sample_alias) %>% 
+      sort
+  )
+)
+
+comp_list_description <- data.frame(
+  comparison = names(comp_list),
+  comparison_long = c('p27--over--WT at 96h')
+)
+
+```
+
+
+#### Table
+```{r table-comparisons}
+i = names(comp_list)[1]
+comp_df <- foreach(i = names(comp_list), .combine = rbind) %do% {
+  icomp <- comp_list[[i]]
+  rbind(
+    data.frame(
+      comparison = i,
+      group = names(icomp)[1],
+      sample = icomp[[1]]
+    ),
+    data.frame(
+      comparison = i,
+      group = names(icomp)[2],
+      sample = icomp[[2]]
+    )
+  )
+}
+
+comp_df %>% 
+  datatable(., 
+            rownames = FALSE, 
+            filter = 'top', 
+            caption = 'DEG : List of comparisons',
+            extensions = 'Buttons', 
+            options = list(
+              dom = 'Blfrtip',
+              buttons = c('csv', 'excel')
+            ))
+```
+
+
+## Data generation
+
+### Differential expression analysis
+Run differential expression analysis using EdgeR QLF
+```{r edgeR-QLF-run, eval = FALSE}
+ensembl <- biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description'),
+                              filters = 'external_gene_name',
+                              values = rowData(se)$gene_name, mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+
+use_comp <-  comp_list[[1]]
+dge_list <- foreach(use_comp = comp_list) %do%{
+  se_cols <- se$sample_alias %in% unlist(use_comp)
+  use_se <- se[,se_cols]
+  use_se$group <- ifelse(
+    use_se$sample_alias %in% use_comp[[1]],
+    names(use_comp)[1],
+    names(use_comp)[2]
+  )
+  
+  if(is.null(use_comp$batch)) {
+    dge <- edgeR_dge(
+      use_se,
+      # Design configuration for differential expression
+      group_var =  'group',
+      group_sample = names(use_comp)[1],
+      group_ref = names(use_comp)[2],
+      design_formula = "~ group",
+      coef = 'last',
+      # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+      assay_to_DGEList = 'counts',
+      assay_to_row_filter = "counts",
+      # Feature filtering parameters
+      use_filterByExpr = TRUE,
+      min_counts = params$min_counts,
+      min_present_prop = params$min_present_prop,
+      # EdgeR workflow configuration
+      run_calcNormFactors = 'TMM',
+      estimateDisp_robust = TRUE,
+      estimateDisp_trend.method = "locfit",
+      glm_approach = "QLF",
+      # Output configuration
+      adjust_method = 'BH'
+      )
+    } else if(use_comp$batch == 'donor') {
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        batch_vars = 'donor',
+        design_formula = "~ donor + group",
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+        )
+    } else {
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        batch_vars = use_comp$batch,
+        design_formula = paste0("~ ", use_comp$batch," + group"),
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+        )
+    }
+
+  use_res <- dge$results %>%  left_join(., gene_desc)
+  dge$results <- use_res %>% 
+    filter(!duplicated(feature)) %>% 
+    mutate(rownames = feature) %>% 
+    column_to_rownames('rownames')
+  
+   return(dge)
+}
+
+names(dge_list) <- names(comp_list)
+detach("package:biomaRt", unload=TRUE)
+# Save objects
+saveRDS(dge_list, file = file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+
+
+```
+
+### Functional enrichment
+```{r gse-run, eval = FALSE}
+library(org.Hs.eg.db)
+dge_list <- readRDS(file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+dge <-  dge_list[[1]]
+gse_list <- list()
+gse_list <- foreach(dge = dge_list) %do%{
+# for(dge_names in names(dge_list) ari) {
+  # dge <- dge_list[[dge_names]]
+  # cat('######', dge_names, "\n\n\n")
+  cat('####', dge$comparison, "\n\n\n")
+  # gse_list[[dge_names]] <- gse_omnibus(
+  gse_res <- gse_omnibus(
+    feature_names = dge$results$gene_name,
+    p = dge$results$FDR,
+    fc = dge$results$logFC,
+    fc_thrs = 0.5,
+    gmt_files = gmt_files_symbols,
+    
+    run_enricher = FALSE,
+    run_enrichGO = FALSE,
+    run_enrichKEGG = FALSE,
+    run_enrichReactome = FALSE,
+    
+    run_GSEA = TRUE,
+    run_gseGO = FALSE,
+    run_gseKEGG = FALSE,
+    run_gseReactome = TRUE,
+    
+    go_ontologies = c('BP'),
+    args_gse = list(
+      minGSSize = 10,
+      maxGSSize = 250,
+      pvalueCutoff = 1),
+    args_enricher = list(
+      minGSSize = 10,
+      maxGSSize = 250, 
+      pvalueCutoff = 1),
+    go_simplify = TRUE,
+    go_simplify_p = 0.1,
+    go_simplify_cutoff = 0.6
+    )
+  
+   return(gse_res)
+
+}
+names(gse_list) <- names(dge_list)
+
+# Save objects
+saveRDS(gse_list, file = file.path(params$output_dir,'gse_omnibus-edgeR_QLF.rds'))
+```
+
+### Load data
+```{r load-deg-data}
+dge_list <- readRDS(file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+gse_list <- readRDS(file.path(params$output_dir, 'gse_omnibus-edgeR_QLF.rds'))
+# Annotate dge_list with dormancy genes
+i <- names(dge_list)[[1]]
+for (i in names(dge_list)) {
+  dge_list[[i]]$results$is_dormancy <- 
+    dge_list[[i]]$results$gene_name %in% dormancy_genes$gene_name
+}
+```
+
+
+
+## Differential expression analysis
+```{r knitr-template-rnaseq-deg-edger, eval = TRUE}
+se$condition <- se$dormancy_brightness
+group_palette <- get_scater_palette('tableau10medium')[1:nlevels(se$condition)] %>% 
+  set_names(levels(se$condition))
+
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-deg-edger.Rmd")
+  )
+```
+`r knit(text = src)`
+
+## Functional enrichment analysis
+```{r knitr-template-rnaseq-gse-omnibus, eval = TRUE}
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-gse-omnibus.Rmd")
+  )
+```
+`r knit(text = src)`
+
+
+
