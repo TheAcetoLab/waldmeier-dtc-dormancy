@@ -12,7 +12,7 @@ navbar:
   right:
   - icon: fab fa-github
     text: Source code
-    href: https://github.com/acetolab/waldmeier-dtc-dormancy
+    href: https://github.com/TheAcetoLab/waldmeier-dtc-dormancy
 output:
   workflowr::wflow_html:
     toc: yes
