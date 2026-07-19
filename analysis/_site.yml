@@ -1,7 +1,7 @@
-name: "waldmeier-dtc-dormancy"
+name: waldmeier-dtc-dormancy
 output_dir: ../docs
 navbar:
-  title: "waldmeier-dtc-dormancy"
+  title: waldmeier-dtc-dormancy
   left:
   - text: Home
     href: index.html
@@ -9,6 +9,10 @@ navbar:
     href: about.html
   - text: License
     href: license.html
+  right:
+  - icon: fab fa-github
+    text: Source code
+    href: https://github.com/acetolab/waldmeier-dtc-dormancy
 output:
   workflowr::wflow_html:
     toc: yes
