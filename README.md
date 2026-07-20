@@ -1,4 +1,5 @@
-# Synthetic lethality with shear stress: exploiting hemodynamic forces to dismantle circulating tumor cells
+# Vulnerabilities of disseminated tumor cells in the bone of a patient-derived CTC breast cancer model
+
 
 
 A [workflowr][] project.
